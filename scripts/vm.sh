@@ -52,7 +52,9 @@ _delete_vms_by_prefix() {
     fi
     log "INFO" "Deleting VMs matching prefix ${prefix}..."
     local vms
-    vms=$(lvirsh list --all | awk '{print $2}' | grep "^${prefix}" || true)
+    local vms_raw
+    vms_raw=$(lvirsh list --all || true)
+    vms=$(echo "${vms_raw}" | awk '{print $2}' | grep "^${prefix}" || true)
     for vm in ${vms}; do
         lvirsh destroy "${vm}" 2>/dev/null || true
         lvirsh undefine "${vm}" --remove-all-storage --nvram 2>/dev/null \

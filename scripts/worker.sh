@@ -1,5 +1,5 @@
 #!/bin/bash
-# worker.sh - Worker node provisioning via BMO/Redfish
+# worker.sh - Worker node provisioning via BMO/IPMI
 
 set -e
 set -o pipefail
@@ -12,6 +12,257 @@ source "${SCRIPT_DIR}/cluster.sh"
 # Use existing path conventions from env.sh
 WORKER_TEMPLATE_DIR="${MANIFESTS_DIR}/worker-provisioning"
 WORKER_GENERATED_DIR="${GENERATED_DIR}/worker-provisioning"
+
+# -----------------------------------------------------------------------------
+# BMC power management (ipmitool) for script-based automation (clean-all/all)
+# -----------------------------------------------------------------------------
+
+# Helper to run ipmitool securely by passing password via a temporary file.
+# Avoids passing credentials via command line arguments (-P) or environment variables (-E).
+_run_ipmitool() {
+    local bmc_ip="$1"
+    local user="$2"
+    local pass="$3"
+    shift 3
+    # Remaining arguments are passed to ipmitool (e.g., power status)
+
+    local pw_file
+    pw_file=$(mktemp "${TMPDIR:-/tmp}/ipmipass.XXXXXX")
+    printf "%s" "${pass}" > "${pw_file}"
+    chmod 600 "${pw_file}"
+
+    # Use a subshell to ensure we capture output and status correctly
+    local status=0
+    local output
+    output=$(ipmitool -I lanplus -H "${bmc_ip}" -U "${user}" -f "${pw_file}" "$@" 2>/dev/null) || status=$?
+    
+    rm -f "${pw_file}"
+    
+    echo "${output}"
+    return "${status}"
+}
+
+_bmc_get_power_state() {
+    local bmc_ip="$1"
+    local user="$2"
+    local pass="$3"
+
+    local status_output
+    status_output=$(_run_ipmitool "${bmc_ip}" "${user}" "${pass}" power status || echo "Unknown")
+    
+    if [[ "${status_output}" == *"is on"* ]]; then
+        echo "On"
+    elif [[ "${status_output}" == *"is off"* ]]; then
+        echo "Off"
+    else
+        echo "Unknown"
+    fi
+}
+
+_bmc_power_action() {
+    local bmc_ip="$1"
+    local user="$2"
+    local pass="$3"
+    local action="$4"
+
+    log "INFO" "Attempting power '${action}' via ipmitool on ${bmc_ip}..."
+    if ! _run_ipmitool "${bmc_ip}" "${user}" "${pass}" power "${action}" >/dev/null; then
+        log "ERROR" "ipmitool power '${action}' failed on ${bmc_ip}"
+        return 1
+    fi
+    return 0
+}
+
+# Poll power state until Off or the retry budget is exhausted.
+_bmc_wait_for_off() {
+    local bmc_ip="$1"
+    local user="$2"
+    local pass="$3"
+    local max_retries="$4"
+    local sleep_interval="$5"
+
+    local retries=0 current_state
+    while [[ $retries -lt $max_retries ]]; do
+        sleep "${sleep_interval}"
+        current_state=$(_bmc_get_power_state "${bmc_ip}" "${user}" "${pass}")
+        if [[ "${current_state}" == "Off" ]]; then
+            return 0
+        fi
+        retries=$((retries + 1))
+    done
+    return 1
+}
+
+# Poll power state until On or the retry budget is exhausted.
+_bmc_wait_for_on() {
+    local bmc_ip="$1"
+    local user="$2"
+    local pass="$3"
+    local max_retries="$4"
+    local sleep_interval="$5"
+
+    local retries=0 current_state
+    while [[ $retries -lt $max_retries ]]; do
+        sleep "${sleep_interval}"
+        current_state=$(_bmc_get_power_state "${bmc_ip}" "${user}" "${pass}")
+        if [[ "${current_state}" == "On" ]]; then
+            return 0
+        fi
+        retries=$((retries + 1))
+    done
+    return 1
+}
+
+# Power off a server: use graceful ACPI shutdown (soft) via IPMI
+_bmc_power_off() {
+    local bmc_ip="$1"
+    local user="$2"
+    local pass="$3"
+
+    local current_state
+    current_state=$(_bmc_get_power_state "${bmc_ip}" "${user}" "${pass}")
+    if [[ "${current_state}" == "Off" ]]; then
+        log "INFO" "Server ${bmc_ip} is already off"
+        return 0
+    fi
+
+    log "INFO" "Attempting graceful shutdown of ${bmc_ip} via ipmitool (soft)..."
+    if _bmc_power_action "${bmc_ip}" "${user}" "${pass}" "soft"; then
+        # Increase wait time for graceful shutdown to 60 retries * 2s = 120s (2 minutes)
+        if _bmc_wait_for_off "${bmc_ip}" "${user}" "${pass}" 60 2; then
+            log "INFO" "Server ${bmc_ip} shut down gracefully"
+            return 0
+        fi
+        log "WARN" "Server ${bmc_ip} did not shut down gracefully within 120s"
+    fi
+
+    log "INFO" "Powering off ${bmc_ip} via ipmitool (off)..."
+    _bmc_power_action "${bmc_ip}" "${user}" "${pass}" "off"
+
+    if _bmc_wait_for_off "${bmc_ip}" "${user}" "${pass}" 30 2; then
+        log "INFO" "Server ${bmc_ip} is powered off"
+        return 0
+    fi
+
+    log "WARN" "Server ${bmc_ip} may not have fully powered off"
+    return 1
+}
+
+# Power on a server via ipmitool. No-op if already On.
+_bmc_power_on() {
+    local bmc_ip="$1"
+    local user="$2"
+    local pass="$3"
+
+    local current_state
+    current_state=$(_bmc_get_power_state "${bmc_ip}" "${user}" "${pass}")
+    if [[ "${current_state}" == "On" ]]; then
+        log "INFO" "Server ${bmc_ip} is already on"
+        return 0
+    fi
+
+    log "INFO" "Powering on ${bmc_ip} via ipmitool..."
+    _bmc_power_action "${bmc_ip}" "${user}" "${pass}" "on"
+
+    if _bmc_wait_for_on "${bmc_ip}" "${user}" "${pass}" 30 2; then
+        log "INFO" "Server ${bmc_ip} is powered on"
+        return 0
+    fi
+
+    log "WARN" "Server ${bmc_ip} may not have fully powered on"
+    return 1
+}
+
+_shutoff_worker() {
+    local index="$1"
+
+    local name_var="WORKER_${index}_NAME"
+    local bmc_ip_var="WORKER_${index}_BMC_IP"
+    local bmc_user_var="WORKER_${index}_BMC_USER"
+    local bmc_pass_var="WORKER_${index}_BMC_PASSWORD"
+
+    local name="${!name_var:-worker-${index}}"
+    local bmc_ip="${!bmc_ip_var:-}"
+    local bmc_user="${!bmc_user_var:-}"
+    local bmc_pass="${!bmc_pass_var:-}"
+
+    if [[ -z "${bmc_ip}" || -z "${bmc_user}" || -z "${bmc_pass}" ]]; then
+        log "ERROR" "Worker ${index} (${name}) missing BMC credentials, cannot perform shutoff"
+        return 1
+    fi
+
+    log "INFO" "Shutting off worker ${name} (${bmc_ip})..."
+    _bmc_power_off "${bmc_ip}" "${bmc_user}" "${bmc_pass}"
+}
+
+shutoff_all_workers() {
+    local count="${WORKER_COUNT:-0}"
+    if [[ "${count}" -eq 0 ]]; then
+        log "INFO" "WORKER_COUNT=0, skipping physical worker shutoff"
+        return 0
+    fi
+
+    log "INFO" "Powering off ${count} physical worker(s) via ipmitool..."
+    local failed=0
+    for i in $(seq 1 "${count}"); do
+        if ! _shutoff_worker "${i}"; then
+            failed=$((failed + 1))
+        fi
+    done
+
+    if [[ "${failed}" -gt 0 ]]; then
+        log "WARN" "Failed to shut off ${failed}/${count} worker(s)"
+        return 1
+    fi
+
+    log "INFO" "All configured workers powered off"
+}
+
+_poweron_worker() {
+    local index="$1"
+
+    local name_var="WORKER_${index}_NAME"
+    local bmc_ip_var="WORKER_${index}_BMC_IP"
+    local bmc_user_var="WORKER_${index}_BMC_USER"
+    local bmc_pass_var="WORKER_${index}_BMC_PASSWORD"
+
+    local name="${!name_var:-worker-${index}}"
+    local bmc_ip="${!bmc_ip_var:-}"
+    local bmc_user="${!bmc_user_var:-}"
+    local bmc_pass="${!bmc_pass_var:-}"
+
+    if [[ -z "${bmc_ip}" || -z "${bmc_user}" || -z "${bmc_pass}" ]]; then
+        log "ERROR" "Worker ${index} (${name}) missing BMC credentials, cannot perform power-on"
+        return 1
+    fi
+
+    log "INFO" "Powering on worker ${name} (${bmc_ip})..."
+    _bmc_power_on "${bmc_ip}" "${bmc_user}" "${bmc_pass}"
+}
+
+# Power on all configured physical workers via ipmitool.
+poweron_all_workers() {
+    local count="${WORKER_COUNT:-0}"
+    if [[ "${count}" -eq 0 ]]; then
+        log "INFO" "WORKER_COUNT=0, skipping physical worker power-on"
+        return 0
+    fi
+
+    log "INFO" "Powering on ${count} physical worker(s) via ipmitool..."
+    local failed=0
+    for i in $(seq 1 "${count}"); do
+        if ! _poweron_worker "${i}"; then
+            failed=$((failed + 1))
+        fi
+    done
+
+    if [[ "${failed}" -gt 0 ]]; then
+        log "WARN" "Failed to power on ${failed}/${count} worker(s)"
+        return 1
+    fi
+
+    log "INFO" "All configured workers powered on"
+}
 
 provision_all_workers() {
     local count="${WORKER_COUNT:-0}"
@@ -43,26 +294,6 @@ provision_all_workers() {
 
     mkdir -p "${WORKER_GENERATED_DIR}"
     log "INFO" "Provisioning ${count} worker(s)..."
-
-    # Detect SNO environment (VM_COUNT=1)
-    # In SNO with platform "None", Machine API is in NoOp mode and MachineSets won't work
-    local is_sno=false
-    [[ "${VM_COUNT:-0}" -eq 1 ]] && is_sno=true
-
-    # Create shared MachineSet for DPU workers (only in non-SNO environments)
-    if [[ "$is_sno" == "false" ]]; then
-        # Create shared MachineSet if we have DPU workers and not SNO
-        if [[ $dpu_count -gt 0 ]]; then
-            log "INFO" "Creating/updating shared MachineSet for $dpu_count DPU worker(s)..."
-            sed "s/replicas: 1/replicas: $dpu_count/" \
-                "${WORKER_TEMPLATE_DIR}/machineset-dpu.yaml" \
-                > "${WORKER_GENERATED_DIR}/machineset-dpu.yaml"
-            retry 5 10 apply_manifest "${WORKER_GENERATED_DIR}/machineset-dpu.yaml" true
-
-        fi
-    else
-        log "INFO" "SNO environment detected (VM_COUNT=1), skipping MachineSet creation (Machine API in NoOp mode)"
-    fi
 
     for i in $(seq 1 "$count"); do
         local name_var="WORKER_${i}_NAME"
@@ -99,11 +330,9 @@ provision_all_workers() {
             "<BMC_USER_BASE64>" "$(printf '%s' "$bmc_user" | base64)" \
             "<BMC_PASSWORD_BASE64>" "$(printf '%s' "$bmc_pass" | base64)"
 
-        # In SNO mode, always use basic baremetalhost.yaml (no MachineSet integration)
-        # In non-SNO mode, use baremetalhost-dpu.yaml for DPU workers (with dpu-capable label)
         local filename="baremetalhost.yaml"
-        if [[ "$is_sno" == "false" ]] && [[ "$is_dpu" == "true" ]]; then
-            filename="baremetalhost-dpu.yaml"
+        if [[ "$is_dpu" == "true" ]]; then
+           filename="baremetalhost-dpu.yaml"
         fi
 
         # Generate BareMetalHost using appropriate template
@@ -215,6 +444,101 @@ delete_csr_auto_approver() {
     log "INFO" "CSR auto-approver removed"
 }
 
+
+# Helper function to delete BMH with automated cleaning disabled
+delete_bmh_with_cleanup() {
+    local bmh_name="$1"
+
+    if oc get bmh -n openshift-machine-api "$bmh_name" &>/dev/null; then
+        log "INFO" "Disabling automated cleaning for BMH: $bmh_name (to skip IPA reboot)"
+        oc patch bmh "$bmh_name" -n openshift-machine-api -p '{"spec":{"automatedCleaningMode":"disabled"}}' --type=merge || \
+            log "WARN" "Failed to disable automated cleaning, continuing..."
+
+        log "INFO" "Deleting BareMetalHost: $bmh_name"
+        oc delete bmh -n openshift-machine-api "$bmh_name" --wait=false
+
+        log "INFO" "Waiting for BMH deletion (this may take up to 15 minutes)..."
+        if ! retry 60 15 bash -c "! oc get bmh -n openshift-machine-api '$bmh_name' &>/dev/null"; then
+            log "ERROR" "Timed out waiting for BMH $bmh_name deletion"
+            return 1
+        fi
+
+        log "INFO" "BMC secret will be automatically deleted (ownerReference to BMH)"
+    else
+        log "INFO" "BareMetalHost $bmh_name not found, skipping"
+    fi
+}
+
+# Helper function to delete the OpenShift Node object
+delete_node() {
+    local node_name="$1"
+    if [[ -z "$node_name" ]]; then
+        log "WARN" "Node name not resolved, skipping node deletion"
+        log "WARN" "You may need to manually delete the Node: oc get nodes && oc delete node <name>"
+        return 0
+    fi
+
+    if oc get node "$node_name" &>/dev/null; then
+        log "INFO" "Deleting Node: $node_name"
+        oc delete node "$node_name"
+        log "INFO" "Node $node_name deleted"
+    else
+        log "INFO" "Node $node_name not found, skipping"
+    fi
+}
+
+delete_worker() {
+    local input_name="${1:-}"
+    [[ -z "$input_name" ]] && { log "ERROR" "Worker name required. Usage: $0 delete-worker <bmh-name|node-name>"; return 1; }
+
+    get_kubeconfig
+
+    log "INFO" "Identifying worker for: $input_name"
+
+    local bmh_name=""
+    local node_name=""
+
+    # Check if it's a BMH name
+    if oc get bmh -n openshift-machine-api "$input_name" &>/dev/null; then
+        bmh_name="$input_name"
+        log "INFO" "Identified as BareMetalHost: $bmh_name"
+
+        # Get node name from BMH status.hardware.hostname
+        node_name=$(oc get bmh -n openshift-machine-api "$bmh_name" -o jsonpath='{.status.hardware.hostname}' 2>/dev/null || true)
+
+    # Check if it's a Node name — find BMH via matching hardware.hostname
+    elif oc get node "$input_name" &>/dev/null; then
+        node_name="$input_name"
+        log "INFO" "Identified as Node: $node_name"
+
+        # Find BMH with this hostname in status.hardware (BMH.status.hardware.hostname matches Node name)
+        bmh_name=$(oc get bmh -n openshift-machine-api -o json 2>/dev/null | \
+            jq -r --arg node "$node_name" \
+            '.items[] | select(.status.hardware.hostname == $node) | .metadata.name' 2>/dev/null | head -1)
+
+        if [[ -z "$bmh_name" ]]; then
+            log "WARN" "Could not find BMH for node: $node_name (may already be deleted)"
+        fi
+
+    else
+        log "ERROR" "Could not find BareMetalHost or Node named: $input_name"
+        return 1
+    fi
+
+    [[ -z "$bmh_name" ]] && { log "ERROR" "Could not determine BareMetalHost name"; return 1; }
+
+    log "INFO" "Worker mapping - BMH: $bmh_name, Node: ${node_name:-unknown}"
+
+    # Delete BMH (handles all workers uniformly now — no MachineSet)
+    log "INFO" "Deleting worker: $bmh_name"
+    delete_bmh_with_cleanup "$bmh_name"
+
+    # Delete the node if it exists
+    delete_node "$node_name"
+
+    log "INFO" "Worker $bmh_name deletion completed"
+}
+
 # Command dispatcher
 case "${1:-}" in
     provision-all-workers) provision_all_workers ;;
@@ -224,8 +548,11 @@ case "${1:-}" in
     apply-short-worker-hostnames) apply_short_worker_hostnames ;;
     deploy-csr-auto-approver) deploy_csr_auto_approver ;;
     delete-csr-auto-approver) delete_csr_auto_approver ;;
+    delete-worker) delete_worker "${2:-}" ;;
+    shutoff-all-workers) shutoff_all_workers ;;
+    poweron-all-workers) poweron_all_workers ;;
     *)
-        echo "Usage: $0 {provision-all-workers|approve-worker-csrs|display-worker-status|display-manual-csr-instructions|apply-short-worker-hostnames|deploy-csr-auto-approver|delete-csr-auto-approver}"
+        echo "Usage: $0 {provision-all-workers|approve-worker-csrs|display-worker-status|display-manual-csr-instructions|apply-short-worker-hostnames|deploy-csr-auto-approver|delete-csr-auto-approver|delete-worker <bmh-name|machine-name|node-name>|shutoff-all-workers|poweron-all-workers}"
         exit 1
         ;;
 esac
