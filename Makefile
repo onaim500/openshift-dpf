@@ -42,8 +42,7 @@ WORKER_SCRIPT := scripts/worker.sh
         delete-dpf-hcp-provisioner-operator \
         verify-deployment verify-workers verify-dpu-nodes verify-dpudeployment \
         run-traffic-flow-tests tft-setup tft-cleanup tft-show-config tft-results aicli-list \
-        validate-env-files generate-env deploy-observability \
-        poweron-workers shutoff-workers
+        validate-env-files generate-env deploy-observability poweron-workers
 
 all: 
 	@mkdir -p logs
@@ -225,30 +224,26 @@ update-etc-hosts:
 clean-all:
 	@echo "Step 1/4: Powering off physical workers via ipmitool (release ingress/API VIPs)..."
 	@$(WORKER_SCRIPT) shutoff-all-workers
-	@echo "Step 2/4: Deleting Assisted Installer cluster and generated files..."
+	@echo "Step 2/4: Destroying worker VMs (release ingress/API VIPs)..."
+	@$(VM_SCRIPT) delete-worker-vms
+	@echo "Step 3/4: Deleting Assisted Installer cluster and generated files..."
 	@$(CLUSTER_SCRIPT) clean-all
-	@echo "Step 3/4: Destroying all VMs..."
+	@echo "Step 4/4: Destroying remaining VMs (control-plane; worker VMs already removed in step 2)..."
 	@$(VM_SCRIPT) delete
-
-.PHONY: poweron-workers
-poweron-workers:
-	@echo "Powering on physical workers via ipmitool (control-plane is up, VIPs are safe)..."
-	@$(WORKER_SCRIPT) poweron-all-workers
-	@if [ "$${WORKER_COUNT:-0}" -gt 0 ]; then \
-		echo "Waiting $(WORKER_POWER_ON_DELAY)s for worker hosts/DPUs to settle before BMO provisioning..."; \
-		sleep "$${WORKER_POWER_ON_DELAY:-180}"; \
-	fi
-
-.PHONY: shutoff-workers
-shutoff-workers:
-	@echo "Powering off physical workers via ipmitool (release ingress/API VIPs)..."
-	@$(WORKER_SCRIPT) shutoff-all-workers
 
 kubeconfig:
 	@$(CLUSTER_SCRIPT) get-kubeconfig
 
 kubeadmin-password:
 	@$(CLUSTER_SCRIPT) get-kubeadmin-password
+
+poweron-workers:
+	@echo "Powering on physical workers via ipmitool (control-plane is up, VIPs are safe)..."
+	@$(WORKER_SCRIPT) poweron-all-workers
+	@if [ "$${WORKER_COUNT:-0}" -gt 0 ]; then \
+		echo "Waiting $(WORKER_POWER_ON_DELAY)s for worker hosts/DPUs to settle before BMO provisioning..."; \
+		sleep "$(WORKER_POWER_ON_DELAY)"; \
+	fi
 
 deploy-nfd:
 	@$(DPF_SCRIPT) deploy-nfd
@@ -373,7 +368,6 @@ help:
 	@echo "  clean            - Remove generated files"
 	@echo "  clean-all        - Power off physical workers (ipmitool), delete cluster, VMs, and clean all generated files"
 	@echo "  poweron-workers  - Power on physical workers (ipmitool) and wait for settling"
-	@echo "  shutoff-workers  - Power off physical workers (ipmitool)"
 	@echo ""
 	@echo "VM Management:"
 	@echo "  create-vms        - Create virtual machines for the cluster"
