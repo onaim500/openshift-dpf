@@ -31,9 +31,10 @@ var (
 	mgmtClientset *kubernetes.Clientset
 	mgmtConfig    *rest.Config
 
-	hostedClient    client.Client
-	hostedClientset *kubernetes.Clientset
-	hostedConfig    *rest.Config
+	hostedClient          client.Client
+	hostedClientset       *kubernetes.Clientset
+	hostedConfig          *rest.Config
+	hostedKubeconfigBytes []byte
 
 	dpuHostWorkers []corev1.Node
 	dpuWorkers     []corev1.Node
@@ -67,6 +68,7 @@ var _ = BeforeSuite(func() {
 	secretName := fmt.Sprintf("%s-admin-kubeconfig", cfg.HostedClusterName)
 	kubeconfigBytes, err := utils.ExtractHostedKubeconfig(ctx, mgmtClient, cfg.ClustersNamespace, secretName)
 	Expect(err).NotTo(HaveOccurred(), "failed to extract hosted cluster kubeconfig")
+	hostedKubeconfigBytes = append([]byte(nil), kubeconfigBytes...)
 
 	By("Creating hosted cluster clients")
 	hosted, err := utils.NewClusterClientsFromBytes(kubeconfigBytes)
@@ -195,8 +197,15 @@ var _ = ReportAfterEach(func(spec SpecReport) {
 })
 
 var _ = AfterSuite(func() {
+	defer cleanupStandaloneDPFCTLBinary()
+
+	By("Running TC-LOG-002 end-of-suite standalone dpfctl describe all")
+	describeErr := runStandaloneDPFCTLDescribeAll(ctx, osCommandRunner{}, cfg.Kubeconfig)
+
 	if dpfe2e.CleanupTracker != nil {
 		By("Performing final suite cleanup")
 		dpfe2e.CleanupTracker.HandleScopeLifecycle(nil, cleanup.GinkgoHook.AfterSuite)
 	}
+
+	Expect(describeErr).NotTo(HaveOccurred(), "TC-LOG-002 end-of-suite standalone dpfctl describe all failed")
 })

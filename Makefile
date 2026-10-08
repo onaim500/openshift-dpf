@@ -1,5 +1,5 @@
 # Include environment variables (skip for targets that don't need a .env)
-ifeq ($(filter generate-env validate-env-files test-go-e2e help,$(MAKECMDGOALS)),)
+ifeq ($(filter generate-env validate-env-files generate-env-test validate-env-test-files test-go-e2e help,$(MAKECMDGOALS)),)
 include .env
 export
 endif
@@ -367,6 +367,13 @@ FORCE ?= false
 generate-env: validate-env-files
 	@$(ENV_SCRIPT) generate-env $(FORCE)
 
+.PHONY: validate-env-test-files generate-env-test
+validate-env-test-files:
+	@$(ENV_SCRIPT) validate-env-test-files
+
+generate-env-test: validate-env-test-files
+	@$(ENV_SCRIPT) generate-env-test $(FORCE)
+
 help:
 	@echo "Available targets:"
 	@echo "Cluster Management:"
@@ -436,6 +443,8 @@ help:
 	@echo ""
 	@echo "E2E Tests:"
 	@echo "  test-go-e2e            - Run Go e2e tests (E2E_GO_LABEL_FILTER=dpudeployment-lifecycle)"
+	@echo "  validate-env-test-files - Validate E2E environment defaults and template"
+	@echo "  generate-env-test       - Generate .env.test (KUBECONFIG required; FORCE=true to overwrite)"
 	@echo ""
 	@echo "Traffic Flow Tests:"
 	@echo "  run-traffic-flow-tests - Run kubernetes-traffic-flow-tests for network validation"
