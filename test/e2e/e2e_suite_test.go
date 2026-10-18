@@ -16,6 +16,7 @@ import (
 	dpftestutils "github.com/nvidia/doca-platform/test/utils"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -131,6 +132,7 @@ func buildSystemTestInputFromCluster(ctx context.Context, c client.Client, restC
 		Namespace:           dpfe2e.DPFOperatorSystemNamespace,
 		Client:              c,
 		RestConfig:          restCfg,
+		CleanupFlags:        dpfe2e.CleanupFlags,
 		NumberOfDPUsPerNode: 1,
 	}
 
@@ -142,13 +144,14 @@ func buildSystemTestInputFromCluster(ctx context.Context, c client.Client, restC
 			Name:      dpfe2e.ConfigName,
 		}, dpfConfig)).To(Succeed())
 	}).WithTimeout(30 * time.Second).WithPolling(1 * time.Second).Should(Succeed())
-	input.Config = dpfConfig
+	input.Config = createTemplateFromLiveObject(dpfConfig)
+	input.PullSecretNames = append([]string(nil), dpfConfig.Spec.ImagePullSecrets...)
 
 	By("Reading DPUDeployment from cluster")
 	dpuDeploymentList := &dpuservicev1.DPUDeploymentList{}
 	err := c.List(ctx, dpuDeploymentList, client.InNamespace(dpfe2e.DPFOperatorSystemNamespace))
 	if err == nil && len(dpuDeploymentList.Items) > 0 {
-		input.DPUDeployment = &dpuDeploymentList.Items[0]
+		input.DPUDeployment = createTemplateFromLiveObject(&dpuDeploymentList.Items[0])
 		GinkgoWriter.Printf("Found DPUDeployment: %s\n", input.DPUDeployment.Name)
 	}
 
@@ -156,7 +159,7 @@ func buildSystemTestInputFromCluster(ctx context.Context, c client.Client, restC
 	dpuServiceChainList := &dpuservicev1.DPUServiceChainList{}
 	err = c.List(ctx, dpuServiceChainList, client.InNamespace(dpfe2e.DPFOperatorSystemNamespace))
 	if err == nil && len(dpuServiceChainList.Items) > 0 {
-		input.DPUServiceChain = &dpuServiceChainList.Items[0]
+		input.DPUServiceChain = createTemplateFromLiveObject(&dpuServiceChainList.Items[0])
 		GinkgoWriter.Printf("Found DPUServiceChain: %s\n", input.DPUServiceChain.Name)
 	}
 
@@ -164,7 +167,7 @@ func buildSystemTestInputFromCluster(ctx context.Context, c client.Client, restC
 	dpuServiceInterfaceList := &dpuservicev1.DPUServiceInterfaceList{}
 	err = c.List(ctx, dpuServiceInterfaceList, client.InNamespace(dpfe2e.DPFOperatorSystemNamespace))
 	if err == nil && len(dpuServiceInterfaceList.Items) > 0 {
-		input.DPUServiceInterface = &dpuServiceInterfaceList.Items[0]
+		input.DPUServiceInterface = createTemplateFromLiveObject(&dpuServiceInterfaceList.Items[0])
 		GinkgoWriter.Printf("Found DPUServiceInterface: %s\n", input.DPUServiceInterface.Name)
 	}
 
@@ -172,16 +175,48 @@ func buildSystemTestInputFromCluster(ctx context.Context, c client.Client, restC
 	dpuServiceIPAMList := &dpuservicev1.DPUServiceIPAMList{}
 	err = c.List(ctx, dpuServiceIPAMList, client.InNamespace(dpfe2e.DPFOperatorSystemNamespace))
 	if err == nil && len(dpuServiceIPAMList.Items) > 0 {
+		assignDPUServiceIPAMTemplates(input, dpuServiceIPAMList.Items)
 		for i := range dpuServiceIPAMList.Items {
 			ipam := &dpuServiceIPAMList.Items[i]
-			if input.IPPoolDPUServiceIPAM == nil {
-				input.IPPoolDPUServiceIPAM = ipam
-			}
 			GinkgoWriter.Printf("Found DPUServiceIPAM: %s\n", ipam.Name)
 		}
 	}
 
 	return input
+}
+
+// createTemplateFromLiveObject returns an independent copy with metadata that
+// belongs to the existing API object removed. The upstream SystemTestInput
+// fields are create templates, even though this suite discovers their specs
+// from an already-running cluster.
+func createTemplateFromLiveObject[T client.Object](live T) T {
+	template := live.DeepCopyObject().(T)
+	template.SetResourceVersion("")
+	template.SetUID("")
+	template.SetGeneration(0)
+	template.SetCreationTimestamp(metav1.Time{})
+	template.SetDeletionTimestamp(nil)
+	template.SetDeletionGracePeriodSeconds(nil)
+	template.SetManagedFields(nil)
+	template.SetOwnerReferences(nil)
+	template.SetFinalizers(nil)
+	return template
+}
+
+// assignDPUServiceIPAMTemplates classifies discovered IPAMs by the pool type
+// expected by the upstream tests. DOCA4 deploys network-mode IPAMs only, so it
+// must not be passed to the subnet/IPPool test merely because it was listed
+// first.
+func assignDPUServiceIPAMTemplates(input *dpfe2e.SystemTestInput, ipams []dpuservicev1.DPUServiceIPAM) {
+	for i := range ipams {
+		template := createTemplateFromLiveObject(&ipams[i])
+		switch {
+		case template.Spec.IPV4Subnet != nil && input.IPPoolDPUServiceIPAM == nil:
+			input.IPPoolDPUServiceIPAM = template
+		case template.Spec.IPV4Network != nil && input.CIDRDPUServiceIPAM == nil:
+			input.CIDRDPUServiceIPAM = template
+		}
+	}
 }
 
 var _ = ReportBeforeEach(func(spec SpecReport) {
