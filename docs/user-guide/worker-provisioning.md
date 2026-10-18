@@ -304,7 +304,7 @@ After completing the provisioning steps above, your workers are ready for DPU-ac
 # Delete worker VMs only
 make delete-worker-vms
 
-# Or delete everything (includes worker VMs and powers off physical workers)
+# Or delete everything (includes worker VMs and gracefully shuts down physical workers)
 make clean-all
 
 # Keep physical workers powered on while deleting the cluster and VMs
