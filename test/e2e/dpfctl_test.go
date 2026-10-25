@@ -127,20 +127,21 @@ func runStandaloneDPFCTLSOSReports(ctx context.Context, runner commandRunner, ma
 		result := runWithTimeout(ctx, runner, binaryPath, task.Args, env)
 
 		// dpfctl can emit benign warnings on stderr, including a missing optional
-		// /etc/dpf-defaults.yaml. Only the process exit status and archive validation
-		// determine whether this task failed.
+		// /etc/dpf-defaults.yaml. Report explicit init-container failures as well
+		// as command errors and missing archives.
 		taskErr := result.Err
+		if failure := sosCollectionFailure(result.Stdout + "\n" + result.Stderr); failure != "" {
+			taskErr = errors.Join(taskErr, fmt.Errorf("dpfctl collect reported: %s", failure))
+		}
 		if err := writeCommandLog(filepath.Join(task.ArtifactDir, "command.log"), result); err != nil {
 			taskErr = errors.Join(taskErr, err)
 		}
-		if taskErr == nil {
-			archivePath := task.OutputDir + ".tar.gz"
-			archiveInfo, archiveErr := os.Stat(archivePath)
-			if archiveErr != nil {
-				taskErr = fmt.Errorf("verify SOS report archive %s: %w", archivePath, archiveErr)
-			} else if archiveInfo.Size() == 0 {
-				taskErr = fmt.Errorf("SOS report archive %s is empty", archivePath)
-			}
+		archivePath := task.OutputDir + ".tar.gz"
+		archiveInfo, archiveErr := os.Stat(archivePath)
+		if archiveErr != nil {
+			taskErr = errors.Join(taskErr, fmt.Errorf("verify SOS report archive %s: %w", archivePath, archiveErr))
+		} else if archiveInfo.Size() == 0 {
+			taskErr = errors.Join(taskErr, fmt.Errorf("SOS report archive %s is empty", archivePath))
 		}
 		if taskErr != nil {
 			if err := captureSOSFailureDiagnostics(ctx, runner, diagnosticKubeconfigs[task.DiagnosticTarget], task); err != nil {
@@ -148,7 +149,8 @@ func runStandaloneDPFCTLSOSReports(ctx context.Context, runner commandRunner, ma
 			}
 		}
 
-		// --cleanup=false keeps failed pods available for the diagnostic above.
+		// --cleanup=false requests retention. v26.4.0 can still remove failed pods;
+		// command.log retains collect's reported failure in that case.
 		// Cleanup is always scoped by this task's unique case ID; target arguments
 		// further restrict DPU cases to the hosted cluster.
 		cleanupResult := runWithTimeout(ctx, runner, binaryPath, task.CleanupArgs, env)
@@ -210,14 +212,14 @@ func captureSOSFailureDiagnostics(ctx context.Context, runner commandRunner, kub
 }
 
 func buildSOSReportTasks(hostNodes, dpuNodes []string, artifactDir, runID string) []sosReportTask {
-	newTask := func(name, caseID, caseArtifactDir, diagnosticTarget, reportTimeout string, targetArgs []string) sosReportTask {
+	newTask := func(name, caseID, caseArtifactDir, diagnosticTarget, reportTimeout, memoryLimit string, targetArgs []string) sosReportTask {
 		outputDir := filepath.Join(caseArtifactDir, "reports")
 		args := []string{"sosreport", "collect"}
 		args = append(args, targetArgs...)
 		args = append(args,
 			"--case-id", caseID,
 			"--timeout", reportTimeout,
-			"--limits.memory", dpfctlSOSMemoryLimit,
+			"--limits.memory", memoryLimit,
 			"--cleanup=false",
 			"--archive",
 			"--archive-only",
@@ -237,12 +239,13 @@ func buildSOSReportTasks(hostNodes, dpuNodes []string, artifactDir, runID string
 	tasks := make([]sosReportTask, 0, len(hostNodes)+len(dpuNodes))
 	for i, node := range hostNodes {
 		tasks = append(tasks, newTask(
-			"no-target-host/"+node,
+			"target-host/"+node,
 			fmt.Sprintf("e2e-dpfctl-host-%s-%d", runID, i),
-			filepath.Join(artifactDir, "no-target-host", node),
+			filepath.Join(artifactDir, "target-host", node),
 			"host",
 			dpfctlSOSHostTimeout,
-			[]string{"--nodes", node},
+			dpfctlSOSHostMemoryLimit,
+			[]string{"--target", "host", "--nodes", node},
 		))
 	}
 	for i, node := range dpuNodes {
@@ -252,6 +255,7 @@ func buildSOSReportTasks(hostNodes, dpuNodes []string, artifactDir, runID string
 			filepath.Join(artifactDir, "target-dpu", node),
 			"dpu",
 			dpfctlSOSDPUTimeout,
+			dpfctlSOSDPUMemoryLimit,
 			[]string{"--target", "dpu", "--nodes", node},
 		))
 	}

@@ -30,11 +30,13 @@ const (
 	dpfctlCleanupPollPeriod = 2 * time.Second
 	dpfctlSOSHostTimeout    = "30m"
 	dpfctlSOSDPUTimeout     = "1h"
-	dpfctlSOSMemoryLimit    = "4Gi"
-	dpfctlSOSNamespace      = "default"
-	dpfctlSOSCaseIDLabel    = "dpfctl.dpu.nvidia.com/case-id"
-	dpfctlSOSManagedLabel   = "app.kubernetes.io/managed-by=dpfctl"
-	dpfctlSOSComponentLabel = "dpfctl.dpu.nvidia.com/component=sosreport"
+	// Candidate limit: the DOCA4 host SOS Job was OOM-killed at 4Gi; validate 6Gi live.
+	dpfctlSOSHostMemoryLimit = "6Gi"
+	dpfctlSOSDPUMemoryLimit  = "4Gi"
+	dpfctlSOSNamespace       = "default"
+	dpfctlSOSCaseIDLabel     = "dpfctl.dpu.nvidia.com/case-id"
+	dpfctlSOSManagedLabel    = "app.kubernetes.io/managed-by=dpfctl"
+	dpfctlSOSComponentLabel  = "dpfctl.dpu.nvidia.com/component=sosreport"
 )
 
 var (
@@ -312,4 +314,15 @@ func appendExecutionLog(artifactDir, message string) error {
 		return fmt.Errorf("append execution log: %w", err)
 	}
 	return nil
+}
+
+// collect may return success after an SOS init-container failure, so retain the
+// archive assertion and include its reported failure in the Ginkgo summary.
+func sosCollectionFailure(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		if strings.Contains(line, "OOMKilled") || strings.Contains(line, "init container") && strings.Contains(line, "failed") {
+			return strings.TrimSpace(line)
+		}
+	}
+	return ""
 }
